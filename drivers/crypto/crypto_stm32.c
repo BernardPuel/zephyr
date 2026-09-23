@@ -440,6 +440,16 @@ static int crypto_stm32_gcm(struct cipher_ctx *ctx, hal_cryp_aes_op_func_t fn,
 	struct crypto_stm32_session *const session = CRYPTO_STM32_SESSN(ctx);
 	uint8_t *dst;
 	uint32_t iv[BLOCK_LEN_WORDS] = {0};
+	/*
+	 * The legacy CRYP header phase always reads HeaderSize as a word count
+	 * regardless of HeaderWidthUnit; pad ad into a word-sized scratch buffer so
+	 * a non-word-multiple ad_len isn't read as a word count of bytes
+	 * (over-reading past the caller's buffer). GCM AAD is typically small
+	 * (protocol headers/counters), so a fixed stack buffer avoids depending on
+	 * a heap that may be too small or absent (CONFIG_HEAP_MEM_POOL_SIZE=0).
+	 */
+	uint8_t hdr_buf[64] __aligned(4);
+	size_t hdr_padded_len;
 
 	if (!IN_RANGE(apkt->pkt->in_len, 0, apkt->pkt->out_buf_max)) {
 		return -EINVAL;
@@ -469,9 +479,25 @@ static int crypto_stm32_gcm(struct cipher_ctx *ctx, hal_cryp_aes_op_func_t fn,
 		session->config.Header = NULL;
 		session->config.HeaderSize = 0U;
 	} else {
-		session->config.Header = CAST_VEC(apkt->ad);
-		session->config.HeaderSize = apkt->ad_len;
-		session->config.HeaderWidthUnit = CRYP_HEADERWIDTHUNIT_BYTE;
+		hdr_padded_len = ROUND_UP(apkt->ad_len, sizeof(uint32_t));
+		if (hdr_padded_len > sizeof(hdr_buf)) {
+			return -EINVAL;
+		}
+
+		memset(hdr_buf, 0, hdr_padded_len);
+		memcpy(hdr_buf, apkt->ad, apkt->ad_len);
+
+		session->config.Header = CAST_VEC(hdr_buf);
+		session->config.HeaderSize = hdr_padded_len / sizeof(uint32_t);
+		/*
+		 * WORD, not BYTE: HAL_CRYPEx_AESGCM_GenerateAuthTAG() derives the
+		 * AAD bit-length fed into the GCM length block from HeaderSize
+		 * using HeaderWidthUnit (HeaderSize * 32 for WORD, * 8 for BYTE),
+		 * while the header phase itself always consumes HeaderSize as a
+		 * word count regardless of HeaderWidthUnit. Both must agree with
+		 * the word count actually fed above.
+		 */
+		session->config.HeaderWidthUnit = CRYP_HEADERWIDTHUNIT_WORD;
 	}
 
 	return do_aes_staged(ctx, fn, apkt->pkt->in_buf, apkt->pkt->in_len, dst);
